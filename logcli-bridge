@@ -1,0 +1,686 @@
+#!/bin/bash
+
+APP_NAME="$(basename "${0}")"
+
+usage() {
+    cat <<EOF 1>&2
+usage: ${APP_NAME} --host HOST [WRAPPER_OPTIONS] -- LOGCLI_ARGS...
+       ${APP_NAME} --host HOST [WRAPPER_OPTIONS] LOGCLI_ARGS...
+
+Run logcli against Loki through Grafana's authenticated datasource proxy.
+
+Wrapper options:
+  -H, --host HOST         Grafana host or URL, for example grafana.example.com
+  --datasource NAME       Grafana datasource name (default: Loki)
+  --chrome-cookies PATH   Chrome Cookies sqlite DB path
+  --cookie COOKIE         Grafana Cookie header value
+  --listen HOST           Local shim host (default: 127.0.0.1)
+  --port PORT             Local shim port (default: random free port)
+  -h, --help              Show this help message and exit
+
+Environment:
+  LOGCLI_BRIDGE_HOST            Same as --host
+  LOGCLI_BRIDGE_DATASOURCE      Same as --datasource
+  LOGCLI_BRIDGE_COOKIE          Same as --cookie
+  LOGCLI_BRIDGE_CHROME_COOKIES  Same as --chrome-cookies
+
+Examples:
+  ${APP_NAME} --host grafana.example.com labels
+  ${APP_NAME} -H grafana.example.com query --since=1h --limit=100 '{namespace="monitoring"}'
+  ${APP_NAME} -H grafana.example.com query --tail '{namespace="monitoring"}'
+EOF
+    exit 1
+}
+
+error() {
+    echo "ERROR: ${1}" 1>&2
+}
+
+warning() {
+    echo "WARNING: ${1}" 1>&2
+}
+
+fail() {
+    error "${1}"
+    exit 1
+}
+
+abort() {
+    echo "Abort." 1>&2
+    exit 1
+}
+
+grafana_host_arg="${LOGCLI_BRIDGE_HOST:-}"
+datasource="${LOGCLI_BRIDGE_DATASOURCE:-${GRAFANA_DATASOURCE:-Loki}}"
+chrome_cookies="${LOGCLI_BRIDGE_CHROME_COOKIES:-${CHROME_COOKIES:-${HOME}/.config/google-chrome/Default/Cookies}}"
+cookie="${LOGCLI_BRIDGE_COOKIE:-${GRAFANA_COOKIE:-}}"
+listen_host="127.0.0.1"
+listen_port="0"
+logcli_args=()
+
+while [ "${#}" -gt 0 ]; do
+    case "${1}" in
+        -h|--help)
+            usage
+            ;;
+        -H|--host)
+            shift
+            [ -z "${1}" ] && usage
+            grafana_host_arg="${1}"
+            ;;
+        --datasource)
+            shift
+            [ -z "${1}" ] && usage
+            datasource="${1}"
+            ;;
+        --chrome-cookies)
+            shift
+            [ -z "${1}" ] && usage
+            chrome_cookies="${1}"
+            ;;
+        --cookie)
+            shift
+            [ -z "${1}" ] && usage
+            cookie="${1}"
+            ;;
+        --listen)
+            shift
+            [ -z "${1}" ] && usage
+            listen_host="${1}"
+            ;;
+        --port)
+            shift
+            [ -z "${1}" ] && usage
+            listen_port="${1}"
+            ;;
+        --)
+            shift
+            [ -z "${grafana_host_arg}" ] && usage
+            logcli_args=("${@}")
+            break
+            ;;
+        *)
+            logcli_args=("${@}")
+            break
+            ;;
+    esac
+    shift
+done
+
+[ -z "${grafana_host_arg}" ] && usage
+[ "${#logcli_args[@]}" -eq 0 ] && usage
+command -v logcli >/dev/null 2>&1 || fail "logcli not found in PATH"
+command -v python3 >/dev/null 2>&1 || fail "python3 not found in PATH"
+
+case "${grafana_host_arg}" in
+    http://*|https://*)
+        grafana_url="${grafana_host_arg}"
+        ;;
+    *)
+        grafana_url="https://${grafana_host_arg}"
+        ;;
+esac
+
+export LOGCLI_BRIDGE_GRAFANA_URL="${grafana_url}"
+export LOGCLI_BRIDGE_DATASOURCE="${datasource}"
+export LOGCLI_BRIDGE_CHROME_COOKIES="${chrome_cookies}"
+export LOGCLI_BRIDGE_COOKIE="${cookie}"
+export LOGCLI_BRIDGE_LISTEN_HOST="${listen_host}"
+export LOGCLI_BRIDGE_LISTEN_PORT="${listen_port}"
+
+exec python3 - "${logcli_args[@]}" <<'PY'
+import asyncio
+import hashlib
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from urllib.parse import quote, urlencode, urlparse
+
+try:
+    from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
+except Exception as exc:
+    print(f"ERROR: Python aiohttp unavailable: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.hashes import SHA1
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+except Exception as exc:
+    print(f"ERROR: Python cryptography unavailable: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+
+GRAFANA_URL = os.environ["LOGCLI_BRIDGE_GRAFANA_URL"].rstrip("/")
+DATASOURCE = os.environ["LOGCLI_BRIDGE_DATASOURCE"]
+COOKIE = os.environ.get("LOGCLI_BRIDGE_COOKIE", "")
+CHROME_COOKIES = os.environ["LOGCLI_BRIDGE_CHROME_COOKIES"]
+LISTEN_HOST = os.environ["LOGCLI_BRIDGE_LISTEN_HOST"]
+LISTEN_PORT = int(os.environ["LOGCLI_BRIDGE_LISTEN_PORT"])
+LOGCLI_ARGS = sys.argv[1:]
+
+
+class UserError(Exception):
+    pass
+
+
+def fail(message):
+    print(f"ERROR: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def origin_from_url(url):
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def grafana_host(url):
+    return urlparse(url).hostname or ""
+
+
+def chrome_time_expired(expires_utc):
+    if not expires_utc:
+        return False
+    # Chrome stores microseconds since 1601-01-01.
+    unix_time = (int(expires_utc) / 1000000) - 11644473600
+    return unix_time <= time.time()
+
+
+def pkcs7_unpad(data):
+    if not data:
+        raise UserError("empty decrypted cookie")
+    pad = data[-1]
+    if pad < 1 or pad > 16 or data[-pad:] != bytes([pad]) * pad:
+        raise UserError("invalid cookie padding")
+    return data[:-pad]
+
+
+def chrome_pbkdf2_key(password):
+    password_bytes = password.encode("utf-8")
+    kdf = PBKDF2HMAC(
+        algorithm=SHA1(),
+        length=16,
+        salt=b"saltysalt",
+        iterations=1,
+    )
+    return kdf.derive(password_bytes)
+
+
+def decode_chrome_plain_cookie(plain, host):
+    try:
+        return plain.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    host_hash = hashlib.sha256(host.encode("utf-8")).digest()
+    if plain.startswith(host_hash):
+        return plain[32:].decode("utf-8")
+    if len(plain) > 32:
+        return plain[32:].decode("utf-8")
+    raise UserError("cookie plaintext is not UTF-8")
+
+
+def decrypt_linux_chrome_cookie(encrypted_value, passwords, host):
+    if not encrypted_value:
+        raise UserError("cookie encrypted_value missing")
+    if encrypted_value.startswith(b"v10") or encrypted_value.startswith(b"v11"):
+        body = encrypted_value[3:]
+        # Old/current Linux Chrome format when no os_crypt encrypted_key exists:
+        # AES-CBC with IV of 16 spaces and PBKDF2-derived key.
+        for password in passwords:
+            try:
+                key = chrome_pbkdf2_key(password)
+                cipher = Cipher(algorithms.AES(key), modes.CBC(b" " * 16))
+                decryptor = cipher.decryptor()
+                plain = decryptor.update(body) + decryptor.finalize()
+                return decode_chrome_plain_cookie(pkcs7_unpad(plain), host)
+            except Exception:
+                pass
+        # Newer AES-GCM cookies are v10/v11 + nonce + ciphertext + tag when
+        # Local State exposes an encrypted_key. This profile does not, but keep
+        # the branch for users with copied profiles.
+        for password in passwords:
+            try:
+                key = chrome_pbkdf2_key(password)
+                return decode_chrome_plain_cookie(AESGCM(key).decrypt(body[:12], body[12:], None), host)
+            except Exception:
+                pass
+    raise UserError("could not decrypt Chrome cookie")
+
+
+def secret_tool_passwords():
+    candidates = []
+    secret_tool = shutil.which("secret-tool")
+    if not secret_tool:
+        return candidates
+    searches = [
+        ["application", "chrome"],
+        ["application", "chromium"],
+        ["xdg:schema", "chrome_libsecret_os_crypt_password_v2"],
+        ["xdg:schema", "chrome_libsecret_os_crypt_password_v1"],
+    ]
+    for attrs in searches:
+        try:
+            proc = subprocess.run(
+                [secret_tool, "lookup", *attrs],
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+        except Exception:
+            continue
+        value = proc.stdout.strip()
+        if proc.returncode == 0 and value and value not in candidates:
+            candidates.append(value)
+    return candidates
+
+
+def read_chrome_cookie_header():
+    cookie_db = Path(CHROME_COOKIES).expanduser()
+    if not cookie_db.exists():
+        raise UserError(f"Chrome cookie DB not found: {cookie_db}")
+
+    host = grafana_host(GRAFANA_URL)
+    with tempfile.NamedTemporaryFile(prefix="logcli-bridge-cookies-", suffix=".sqlite") as tmp:
+        shutil.copy2(cookie_db, tmp.name)
+        con = sqlite3.connect(tmp.name)
+        try:
+            rows = con.execute(
+                """
+                select name, value, encrypted_value, expires_utc
+                from cookies
+                where host_key in (?, ?)
+                  and name in ('grafana_session', 'grafana_session_expiry')
+                """,
+                (host, "." + host),
+            ).fetchall()
+        finally:
+            con.close()
+
+    if not rows:
+        raise UserError(f"No Grafana cookies found for {host}; open {GRAFANA_URL} in Chrome and log in")
+
+    passwords = secret_tool_passwords()
+    for fallback in ("peanuts", ""):
+        if fallback not in passwords:
+            passwords.append(fallback)
+
+    morsel_values = {}
+    for name, value, encrypted_value, expires_utc in rows:
+        if chrome_time_expired(expires_utc):
+            continue
+        if value:
+            morsel_values[name] = value
+            continue
+        try:
+            morsel_values[name] = decrypt_linux_chrome_cookie(encrypted_value, passwords, host)
+        except UserError as exc:
+            raise UserError(
+                f"Could not decrypt {name}. Set GRAFANA_COOKIE manually after browser login."
+            ) from exc
+
+    if "grafana_session" not in morsel_values:
+        raise UserError(f"No valid grafana_session cookie found for {host}; log in to {GRAFANA_URL}")
+
+    return "; ".join(f"{name}={value}" for name, value in morsel_values.items())
+
+
+def cookie_header():
+    if COOKIE:
+        return COOKIE
+    return read_chrome_cookie_header()
+
+
+async def fetch_datasource_uid(session, cookie):
+    url = f"{GRAFANA_URL}/api/datasources/name/{quote(DATASOURCE, safe='')}"
+    async with session.get(url, headers={"Cookie": cookie}) as resp:
+        text = await resp.text()
+        if resp.status in (401, 403):
+            raise UserError(f"Grafana rejected cookie ({resp.status}); log in again or set GRAFANA_COOKIE")
+        if resp.status >= 400:
+            raise UserError(f"Grafana datasource lookup failed ({resp.status}): {text[:200]}")
+        data = json.loads(text)
+    uid = data.get("uid")
+    if not uid:
+        raise UserError(f"Grafana datasource {DATASOURCE!r} has no UID")
+    return uid
+
+
+def tail_query_from_logcli_args(args):
+    if not args or args[0] != "query":
+        return None
+    tail = False
+    query = None
+    i = 1
+    options_with_values = {
+        "--output",
+        "-o",
+        "--timezone",
+        "-z",
+        "--output-timestamp-format",
+        "--cpuprofile",
+        "--memprofile",
+        "--addr",
+        "--username",
+        "--password",
+        "--ca-cert",
+        "--cert",
+        "--key",
+        "--org-id",
+        "--query-tags",
+        "--bearer-token",
+        "--bearer-token-file",
+        "--retries",
+        "--min-backoff",
+        "--max-backoff",
+        "--auth-header",
+        "--proxy-url",
+        "--limit",
+        "--since",
+        "--from",
+        "--to",
+        "--step",
+        "--interval",
+        "--batch",
+        "--parallel-duration",
+        "--parallel-max-workers",
+        "--part-path-prefix",
+        "--exclude-label",
+        "--include-label",
+        "--labels-length",
+        "--store-config",
+        "--schema-store",
+        "--delay-for",
+    }
+    boolean_options = {
+        "-q",
+        "--quiet",
+        "--stats",
+        "--no-stats",
+        "--stdin",
+        "--no-stdin",
+        "--tls-skip-verify",
+        "--no-tls-skip-verify",
+        "--nocache",
+        "--no-nocache",
+        "--compress",
+        "--no-compress",
+        "--envproxy",
+        "--no-envproxy",
+        "--overwrite-completed-parts",
+        "--no-overwrite-completed-parts",
+        "--merge-parts",
+        "--no-merge-parts",
+        "--keep-parts",
+        "--no-keep-parts",
+        "--forward",
+        "--no-forward",
+        "--no-labels",
+        "--include-common-labels",
+        "--no-include-common-labels",
+        "--remote-schema",
+        "--no-remote-schema",
+        "--colored-output",
+        "--no-colored-output",
+        "--tail",
+        "-t",
+        "--follow",
+        "-f",
+    }
+    while i < len(args):
+        arg = args[i]
+        if arg in ("--tail", "-t", "--follow", "-f"):
+            tail = True
+            i += 1
+            continue
+        if arg == "--":
+            if i + 1 < len(args):
+                query = args[i + 1]
+            break
+        if arg in options_with_values:
+            i += 2
+            continue
+        if any(arg.startswith(prefix + "=") for prefix in options_with_values if prefix.startswith("--")):
+            i += 1
+            continue
+        if arg in boolean_options:
+            i += 1
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        query = arg
+        i += 1
+    if tail:
+        return query
+    return None
+
+
+async def validate_tail_query(session, cookie, uid, query):
+    if not query:
+        return
+    now_ns = time.time_ns()
+    params = urlencode(
+        {
+            "query": query,
+            "limit": "1",
+            "start": str(now_ns - 1_000_000_000),
+            "end": str(now_ns),
+        }
+    )
+    url = (
+        f"{GRAFANA_URL}/api/datasources/proxy/uid/{quote(uid, safe='')}"
+        f"/loki/api/v1/query_range?{params}"
+    )
+    async with session.get(url, headers={"Cookie": cookie}) as resp:
+        text = await resp.text()
+        if resp.status < 400:
+            return
+        try:
+            data = json.loads(text)
+            message = data.get("error") or data.get("message") or text
+        except Exception:
+            message = text
+        raise UserError(f"tail query validation failed ({resp.status}): {message.strip()[:500]}")
+
+
+def copy_request_headers(request, cookie):
+    hop_by_hop = {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "host",
+        "cookie",
+        "authorization",
+    }
+    headers = {
+        key: value
+        for key, value in request.headers.items()
+        if key.lower() not in hop_by_hop
+    }
+    headers["Cookie"] = cookie
+    headers["Origin"] = origin_from_url(GRAFANA_URL)
+    return headers
+
+
+def upstream_http_url(uid, request):
+    path = request.path.lstrip("/")
+    url = f"{GRAFANA_URL}/api/datasources/proxy/uid/{quote(uid, safe='')}/{path}"
+    if request.query_string:
+        url = f"{url}?{request.query_string}"
+    return url
+
+
+def upstream_ws_url(uid, request):
+    parsed = urlparse(upstream_http_url(uid, request))
+    scheme = "wss" if parsed.scheme == "https" else "ws"
+    return parsed._replace(scheme=scheme).geturl()
+
+
+async def handle_http(request):
+    app = request.app
+    cookie = app["cookie"]
+    uid = app["uid"]
+    session = app["session"]
+
+    if request.headers.get("upgrade", "").lower() == "websocket":
+        return await handle_ws(request)
+
+    body = await request.read()
+    headers = copy_request_headers(request, cookie)
+    async with session.request(
+        request.method,
+        upstream_http_url(uid, request),
+        data=body,
+        headers=headers,
+        allow_redirects=False,
+    ) as resp:
+        excluded = {
+            "connection",
+            "keep-alive",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "content-encoding",
+        }
+        response_headers = {
+            key: value
+            for key, value in resp.headers.items()
+            if key.lower() not in excluded
+        }
+        data = await resp.read()
+        return web.Response(status=resp.status, headers=response_headers, body=data)
+
+
+async def pump_ws_to_upstream(local_ws, upstream_ws):
+    async for msg in local_ws:
+        if msg.type == WSMsgType.TEXT:
+            await upstream_ws.send_str(msg.data)
+        elif msg.type == WSMsgType.BINARY:
+            await upstream_ws.send_bytes(msg.data)
+        elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED):
+            await upstream_ws.close()
+            break
+        elif msg.type == WSMsgType.ERROR:
+            await upstream_ws.close()
+            break
+
+
+async def pump_ws_to_local(upstream_ws, local_ws):
+    async for msg in upstream_ws:
+        if msg.type == WSMsgType.TEXT:
+            await local_ws.send_str(msg.data)
+        elif msg.type == WSMsgType.BINARY:
+            await local_ws.send_bytes(msg.data)
+        elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSING, WSMsgType.CLOSED):
+            await local_ws.close()
+            break
+        elif msg.type == WSMsgType.ERROR:
+            await local_ws.close()
+            break
+
+
+async def handle_ws(request):
+    app = request.app
+    cookie = app["cookie"]
+    uid = app["uid"]
+    session = app["session"]
+
+    local_ws = web.WebSocketResponse()
+    await local_ws.prepare(request)
+
+    headers = {
+        "Cookie": cookie,
+        "Origin": origin_from_url(GRAFANA_URL),
+    }
+    try:
+        async with session.ws_connect(upstream_ws_url(uid, request), headers=headers, heartbeat=30) as upstream_ws:
+            tasks = [
+                asyncio.create_task(pump_ws_to_upstream(local_ws, upstream_ws)),
+                asyncio.create_task(pump_ws_to_local(upstream_ws, local_ws)),
+            ]
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            for task in done:
+                task.result()
+    except Exception as exc:
+        if not local_ws.closed:
+            await local_ws.close(message=str(exc).encode("utf-8", "replace"))
+    return local_ws
+
+
+async def start_server(cookie, uid):
+    timeout = ClientTimeout(total=None, sock_connect=30)
+    session = ClientSession(timeout=timeout)
+    app = web.Application()
+    app["cookie"] = cookie
+    app["uid"] = uid
+    app["session"] = session
+    app.router.add_route("*", "/{tail:.*}", handle_http)
+
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, LISTEN_HOST, LISTEN_PORT)
+    await site.start()
+    sockets = list(site._server.sockets)
+    if not sockets:
+        raise UserError("local shim did not open a listening socket")
+    port = sockets[0].getsockname()[1]
+    return runner, session, port
+
+
+async def run_logcli(port):
+    cmd = ["logcli", f"--addr=http://{LISTEN_HOST}:{port}", *LOGCLI_ARGS]
+    proc = await asyncio.create_subprocess_exec(*cmd)
+    try:
+        return await proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        try:
+            return await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return await proc.wait()
+
+
+async def main():
+    try:
+        cookie = cookie_header()
+        async with ClientSession(timeout=ClientTimeout(total=30)) as session:
+            uid = await fetch_datasource_uid(session, cookie)
+            await validate_tail_query(session, cookie, uid, tail_query_from_logcli_args(LOGCLI_ARGS))
+        runner, session, port = await start_server(cookie, uid)
+    except UserError as exc:
+        fail(str(exc))
+    except Exception as exc:
+        fail(f"setup failed: {exc}")
+
+    try:
+        return await run_logcli(port)
+    finally:
+        await runner.cleanup()
+        await session.close()
+
+
+try:
+    raise SystemExit(asyncio.run(main()))
+except KeyboardInterrupt:
+    raise SystemExit(130)
+PY
