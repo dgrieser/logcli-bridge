@@ -16,6 +16,7 @@ Wrapper options:
   --cookie COOKIE         Grafana Cookie header value
   --listen HOST           Local shim host (default: 127.0.0.1)
   --port PORT             Local shim port (default: random free port)
+  --verbose               Print bridge target info and logcli request URLs
   -h, --help              Show this help message and exit
 
 Environment:
@@ -45,6 +46,13 @@ fail() {
     exit 1
 }
 
+discover_grafana_host() {
+    [ -z "${KUBECONFIG:-}" ] && return 1
+    command -v kubectl >/dev/null 2>&1 || return 1
+
+    kubectl get ingress -n monitoring kube-prometheus-grafana -o jsonpath='{.spec.rules[*].host}' 2>/dev/null
+}
+
 abort() {
     echo "Abort." 1>&2
     exit 1
@@ -56,6 +64,7 @@ chrome_cookies="${LOGCLI_BRIDGE_CHROME_COOKIES:-${CHROME_COOKIES:-${HOME}/.confi
 cookie="${LOGCLI_BRIDGE_COOKIE:-${GRAFANA_COOKIE:-}}"
 listen_host="127.0.0.1"
 listen_port="0"
+verbose="0"
 logcli_args=()
 
 while [ "${#}" -gt 0 ]; do
@@ -93,6 +102,9 @@ while [ "${#}" -gt 0 ]; do
             [ -z "${1}" ] && usage
             listen_port="${1}"
             ;;
+        --verbose)
+            verbose="1"
+            ;;
         --)
             shift
             [ -z "${grafana_host_arg}" ] && usage
@@ -106,6 +118,10 @@ while [ "${#}" -gt 0 ]; do
     esac
     shift
 done
+
+if [ -z "${grafana_host_arg}" ]; then
+    grafana_host_arg="$(discover_grafana_host)"
+fi
 
 [ -z "${grafana_host_arg}" ] && usage
 [ "${#logcli_args[@]}" -eq 0 ] && usage
@@ -127,6 +143,7 @@ export LOGCLI_BRIDGE_CHROME_COOKIES="${chrome_cookies}"
 export LOGCLI_BRIDGE_COOKIE="${cookie}"
 export LOGCLI_BRIDGE_LISTEN_HOST="${listen_host}"
 export LOGCLI_BRIDGE_LISTEN_PORT="${listen_port}"
+export LOGCLI_BRIDGE_VERBOSE="${verbose}"
 
 exec python3 - "${logcli_args[@]}" <<'PY'
 import asyncio
@@ -164,6 +181,7 @@ COOKIE = os.environ.get("LOGCLI_BRIDGE_COOKIE", "")
 CHROME_COOKIES = os.environ["LOGCLI_BRIDGE_CHROME_COOKIES"]
 LISTEN_HOST = os.environ["LOGCLI_BRIDGE_LISTEN_HOST"]
 LISTEN_PORT = int(os.environ["LOGCLI_BRIDGE_LISTEN_PORT"])
+VERBOSE = os.environ.get("LOGCLI_BRIDGE_VERBOSE", "0") == "1"
 LOGCLI_ARGS = sys.argv[1:]
 
 
@@ -647,7 +665,10 @@ async def start_server(cookie, uid):
 
 
 async def run_logcli(port):
-    cmd = ["logcli", f"--addr=http://{LISTEN_HOST}:{port}", *LOGCLI_ARGS]
+    cmd = ["logcli", f"--addr=http://{LISTEN_HOST}:{port}"]
+    if not VERBOSE:
+        cmd.append("--quiet")
+    cmd.extend(LOGCLI_ARGS)
     proc = await asyncio.create_subprocess_exec(*cmd)
     try:
         return await proc.wait()
@@ -667,6 +688,10 @@ async def main():
             uid = await fetch_datasource_uid(session, cookie)
             await validate_tail_query(session, cookie, uid, tail_query_from_logcli_args(LOGCLI_ARGS))
         runner, session, port = await start_server(cookie, uid)
+        if VERBOSE:
+            print(f"logcli-bridge: Grafana URL: {GRAFANA_URL}", file=sys.stderr)
+            print(f"logcli-bridge: datasource {DATASOURCE!r} uid: {uid}", file=sys.stderr)
+            print(f"logcli-bridge: local URL: http://{LISTEN_HOST}:{port}", file=sys.stderr)
     except UserError as exc:
         fail(str(exc))
     except Exception as exc:
