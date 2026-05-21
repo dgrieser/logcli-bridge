@@ -12,7 +12,8 @@ Run logcli against Loki through Grafana's authenticated datasource proxy.
 Wrapper options:
   -H, --host HOST         Grafana host or URL, for example grafana.example.com
   --datasource NAME       Grafana datasource name (default: Loki)
-  --oauth                 Log in through OAuth instead of Chrome cookies
+  --oauth                 Log in through OAuth (default unless --cookie or --no-oauth is set)
+  --no-oauth              Disable default OAuth and use Chrome cookies
   --oauth-cache PATH      OAuth cache path (default: ~/.cache/logcli-bridge/session.json)
   --oauth-login-path PATH Grafana OAuth login path (default: /login/generic_oauth)
   --oauth-bearer-probe    Try localhost PKCE bearer auth before Grafana session auth
@@ -30,7 +31,7 @@ Wrapper options:
 Environment:
   LOGCLI_BRIDGE_HOST            Same as --host
   LOGCLI_BRIDGE_DATASOURCE      Same as --datasource
-  LOGCLI_BRIDGE_OAUTH           Same as --oauth when set to 1
+  LOGCLI_BRIDGE_OAUTH           Set to 0 to disable default OAuth
   LOGCLI_BRIDGE_OAUTH_CACHE     Same as --oauth-cache
   LOGCLI_BRIDGE_OAUTH_LOGIN_PATH Same as --oauth-login-path
   LOGCLI_BRIDGE_OAUTH_BEARER_PROBE  Same as --oauth-bearer-probe when set to 1
@@ -78,7 +79,7 @@ abort() {
 
 grafana_host_arg="${LOGCLI_BRIDGE_HOST:-}"
 datasource="${LOGCLI_BRIDGE_DATASOURCE:-${GRAFANA_DATASOURCE:-Loki}}"
-oauth="${LOGCLI_BRIDGE_OAUTH:-0}"
+oauth="${LOGCLI_BRIDGE_OAUTH:-1}"
 oauth_cache="${LOGCLI_BRIDGE_OAUTH_CACHE:-${XDG_CACHE_HOME:-${HOME}/.cache}/logcli-bridge/session.json}"
 oauth_login_path="${LOGCLI_BRIDGE_OAUTH_LOGIN_PATH:-/login/generic_oauth}"
 oauth_bearer_probe="${LOGCLI_BRIDGE_OAUTH_BEARER_PROBE:-0}"
@@ -112,6 +113,9 @@ while [ "${#}" -gt 0 ]; do
             ;;
         --oauth)
             oauth="1"
+            ;;
+        --no-oauth)
+            oauth="0"
             ;;
         --oauth-cache)
             shift
@@ -261,7 +265,7 @@ except Exception as exc:
 
 GRAFANA_URL = os.environ["LOGCLI_BRIDGE_GRAFANA_URL"].rstrip("/")
 DATASOURCE = os.environ["LOGCLI_BRIDGE_DATASOURCE"]
-OAUTH = os.environ.get("LOGCLI_BRIDGE_OAUTH", "0").lower() in ("1", "true", "yes", "on")
+OAUTH = os.environ.get("LOGCLI_BRIDGE_OAUTH", "1").lower() in ("1", "true", "yes", "on")
 OAUTH_CACHE = os.environ["LOGCLI_BRIDGE_OAUTH_CACHE"]
 OAUTH_LOGIN_PATH = os.environ.get("LOGCLI_BRIDGE_OAUTH_LOGIN_PATH", "/login/generic_oauth")
 if not OAUTH_LOGIN_PATH.startswith("/"):
