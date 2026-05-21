@@ -12,6 +12,12 @@ Run logcli against Loki through Grafana's authenticated datasource proxy.
 Wrapper options:
   -H, --host HOST         Grafana host or URL, for example grafana.example.com
   --datasource NAME       Grafana datasource name (default: Loki)
+  --oauth                 Log in through OAuth instead of Chrome cookies
+  --oauth-cache PATH      OAuth cache path (default: ~/.cache/logcli-bridge/session.json)
+  --oauth-issuer URL      OAuth issuer override
+  --oauth-client-id ID    OAuth client ID override
+  --oauth-no-browser      Print OAuth URL instead of opening xdg-open
+  --oauth-username NAME   Username for OAuth form fallback
   --chrome-cookies PATH   Chrome Cookies sqlite DB path
   --cookie COOKIE         Grafana Cookie header value
   --listen HOST           Local shim host (default: 127.0.0.1)
@@ -22,6 +28,12 @@ Wrapper options:
 Environment:
   LOGCLI_BRIDGE_HOST            Same as --host
   LOGCLI_BRIDGE_DATASOURCE      Same as --datasource
+  LOGCLI_BRIDGE_OAUTH           Same as --oauth when set to 1
+  LOGCLI_BRIDGE_OAUTH_CACHE     Same as --oauth-cache
+  LOGCLI_BRIDGE_OAUTH_ISSUER    Same as --oauth-issuer
+  LOGCLI_BRIDGE_OAUTH_CLIENT_ID Same as --oauth-client-id
+  LOGCLI_BRIDGE_OAUTH_NO_BROWSER  Same as --oauth-no-browser when set to 1
+  LOGCLI_BRIDGE_OAUTH_USERNAME  Same as --oauth-username
   LOGCLI_BRIDGE_COOKIE          Same as --cookie
   LOGCLI_BRIDGE_CHROME_COOKIES  Same as --chrome-cookies
 
@@ -60,6 +72,12 @@ abort() {
 
 grafana_host_arg="${LOGCLI_BRIDGE_HOST:-}"
 datasource="${LOGCLI_BRIDGE_DATASOURCE:-${GRAFANA_DATASOURCE:-Loki}}"
+oauth="${LOGCLI_BRIDGE_OAUTH:-0}"
+oauth_cache="${LOGCLI_BRIDGE_OAUTH_CACHE:-${XDG_CACHE_HOME:-${HOME}/.cache}/logcli-bridge/session.json}"
+oauth_issuer="${LOGCLI_BRIDGE_OAUTH_ISSUER:-}"
+oauth_client_id="${LOGCLI_BRIDGE_OAUTH_CLIENT_ID:-}"
+oauth_no_browser="${LOGCLI_BRIDGE_OAUTH_NO_BROWSER:-0}"
+oauth_username="${LOGCLI_BRIDGE_OAUTH_USERNAME:-}"
 chrome_cookies="${LOGCLI_BRIDGE_CHROME_COOKIES:-${CHROME_COOKIES:-${HOME}/.config/google-chrome/Default/Cookies}}"
 cookie="${LOGCLI_BRIDGE_COOKIE:-${GRAFANA_COOKIE:-}}"
 listen_host="127.0.0.1"
@@ -81,6 +99,32 @@ while [ "${#}" -gt 0 ]; do
             shift
             [ -z "${1}" ] && usage
             datasource="${1}"
+            ;;
+        --oauth)
+            oauth="1"
+            ;;
+        --oauth-cache)
+            shift
+            [ -z "${1}" ] && usage
+            oauth_cache="${1}"
+            ;;
+        --oauth-issuer)
+            shift
+            [ -z "${1}" ] && usage
+            oauth_issuer="${1}"
+            ;;
+        --oauth-client-id)
+            shift
+            [ -z "${1}" ] && usage
+            oauth_client_id="${1}"
+            ;;
+        --oauth-no-browser)
+            oauth_no_browser="1"
+            ;;
+        --oauth-username)
+            shift
+            [ -z "${1}" ] && usage
+            oauth_username="${1}"
             ;;
         --chrome-cookies)
             shift
@@ -139,6 +183,12 @@ esac
 
 export LOGCLI_BRIDGE_GRAFANA_URL="${grafana_url}"
 export LOGCLI_BRIDGE_DATASOURCE="${datasource}"
+export LOGCLI_BRIDGE_OAUTH="${oauth}"
+export LOGCLI_BRIDGE_OAUTH_CACHE="${oauth_cache}"
+export LOGCLI_BRIDGE_OAUTH_ISSUER="${oauth_issuer}"
+export LOGCLI_BRIDGE_OAUTH_CLIENT_ID="${oauth_client_id}"
+export LOGCLI_BRIDGE_OAUTH_NO_BROWSER="${oauth_no_browser}"
+export LOGCLI_BRIDGE_OAUTH_USERNAME="${oauth_username}"
 export LOGCLI_BRIDGE_CHROME_COOKIES="${chrome_cookies}"
 export LOGCLI_BRIDGE_COOKIE="${cookie}"
 export LOGCLI_BRIDGE_LISTEN_HOST="${listen_host}"
@@ -147,20 +197,26 @@ export LOGCLI_BRIDGE_VERBOSE="${verbose}"
 
 exec python3 - "${logcli_args[@]}" <<'PY'
 import asyncio
+import base64
 import hashlib
+from html.parser import HTMLParser
 import json
 import os
 import shutil
+import secrets
 import sqlite3
+import stat
 import subprocess
 import sys
+import termios
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
 
 try:
-    from aiohttp import ClientSession, ClientTimeout, WSMsgType, web
+    from aiohttp import ClientSession, ClientTimeout, CookieJar, WSMsgType, web
+    from yarl import URL
 except Exception as exc:
     print(f"ERROR: Python aiohttp unavailable: {exc}", file=sys.stderr)
     sys.exit(1)
@@ -177,6 +233,12 @@ except Exception as exc:
 
 GRAFANA_URL = os.environ["LOGCLI_BRIDGE_GRAFANA_URL"].rstrip("/")
 DATASOURCE = os.environ["LOGCLI_BRIDGE_DATASOURCE"]
+OAUTH = os.environ.get("LOGCLI_BRIDGE_OAUTH", "0").lower() in ("1", "true", "yes", "on")
+OAUTH_CACHE = os.environ["LOGCLI_BRIDGE_OAUTH_CACHE"]
+OAUTH_ISSUER = os.environ.get("LOGCLI_BRIDGE_OAUTH_ISSUER", "").rstrip("/")
+OAUTH_CLIENT_ID = os.environ.get("LOGCLI_BRIDGE_OAUTH_CLIENT_ID", "")
+OAUTH_NO_BROWSER = os.environ.get("LOGCLI_BRIDGE_OAUTH_NO_BROWSER", "0").lower() in ("1", "true", "yes", "on")
+OAUTH_USERNAME = os.environ.get("LOGCLI_BRIDGE_OAUTH_USERNAME", "")
 COOKIE = os.environ.get("LOGCLI_BRIDGE_COOKIE", "")
 CHROME_COOKIES = os.environ["LOGCLI_BRIDGE_CHROME_COOKIES"]
 LISTEN_HOST = os.environ["LOGCLI_BRIDGE_LISTEN_HOST"]
@@ -189,9 +251,23 @@ class UserError(Exception):
     pass
 
 
+class BearerUnavailable(UserError):
+    pass
+
+
 def fail(message):
     print(f"ERROR: {message}", file=sys.stderr)
     sys.exit(1)
+
+
+def vprint(message):
+    if VERBOSE:
+        print(f"logcli-bridge: {message}", file=sys.stderr)
+
+
+def safe_url(url):
+    parsed = urlparse(str(url))
+    return parsed._replace(query="", fragment="").geturl()
 
 
 def origin_from_url(url):
@@ -201,6 +277,22 @@ def origin_from_url(url):
 
 def grafana_host(url):
     return urlparse(url).hostname or ""
+
+
+def make_cookie_auth(cookie, source="cookie"):
+    return {"type": "cookie", "cookie": cookie, "source": source}
+
+
+def make_bearer_auth(token, source="oauth"):
+    return {"type": "bearer", "token": token, "source": source}
+
+
+def auth_headers(auth):
+    if auth["type"] == "cookie":
+        return {"Cookie": auth["cookie"]}
+    if auth["type"] == "bearer":
+        return {"Authorization": f"Bearer {auth['token']}"}
+    raise UserError(f"unknown auth type: {auth.get('type')}")
 
 
 def chrome_time_expired(expires_utc):
@@ -351,18 +443,526 @@ def read_chrome_cookie_header():
     return "; ".join(f"{name}={value}" for name, value in morsel_values.items())
 
 
-def cookie_header():
+def cookie_auth():
     if COOKIE:
-        return COOKIE
-    return read_chrome_cookie_header()
+        return make_cookie_auth(COOKIE, "cookie")
+    return make_cookie_auth(read_chrome_cookie_header(), "chrome")
 
 
-async def fetch_datasource_uid(session, cookie):
+def read_oauth_cache():
+    path = Path(OAUTH_CACHE).expanduser()
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        vprint(f"oauth: cache miss: {path}")
+        return None
+    except Exception as exc:
+        vprint(f"oauth: ignoring unreadable cache {path}: {exc}")
+        return None
+
+
+def cached_oauth_auth():
+    data = read_oauth_cache()
+    if not data:
+        return None
+    if data.get("grafana_url") != GRAFANA_URL:
+        vprint("oauth: ignoring cache for different Grafana URL")
+        return None
+    if OAUTH_ISSUER and data.get("issuer") != OAUTH_ISSUER:
+        vprint("oauth: ignoring cache for different issuer")
+        return None
+    if OAUTH_CLIENT_ID and data.get("client_id") != OAUTH_CLIENT_ID:
+        vprint("oauth: ignoring cache for different client ID")
+        return None
+    if int(data.get("expires_at") or 0) <= int(time.time()) + 60:
+        vprint("oauth: ignoring expired cache")
+        return None
+    if data.get("type") == "bearer" and data.get("access_token"):
+        vprint("oauth: using cached bearer token")
+        return make_bearer_auth(data["access_token"], "oauth-cache")
+    if data.get("type") == "cookie" and data.get("cookie"):
+        vprint("oauth: using cached Grafana session cookie")
+        return make_cookie_auth(data["cookie"], "oauth-cache")
+    vprint("oauth: ignoring cache without supported auth material")
+    return None
+
+
+def save_oauth_cache(entry):
+    path = Path(OAUTH_CACHE).expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entry = dict(entry)
+    entry["grafana_url"] = GRAFANA_URL
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(entry, fh, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        vprint(f"oauth: saved {entry.get('type', 'unknown')} auth cache to {path}")
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def issuer_from_authorize_url(authorize_url):
+    parsed = urlparse(authorize_url)
+    marker = "/protocol/openid-connect/auth"
+    if marker in parsed.path:
+        issuer_path = parsed.path.split(marker, 1)[0]
+        return f"{parsed.scheme}://{parsed.netloc}{issuer_path}".rstrip("/")
+    return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+
+
+async def discover_oauth_config(session):
+    authorize_url = ""
+    client_id = OAUTH_CLIENT_ID
+    issuer = OAUTH_ISSUER
+    scope = "openid email profile offline_access roles"
+
+    vprint("oauth: discovering config from Grafana /login/generic_oauth")
+    try:
+        async with session.get(f"{GRAFANA_URL}/login/generic_oauth", allow_redirects=False) as resp:
+            location = resp.headers.get("Location", "")
+            vprint(f"oauth: Grafana OAuth start returned HTTP {resp.status}")
+            if 300 <= resp.status < 400 and location:
+                authorize_url = urljoin(str(resp.url), location)
+                vprint(f"oauth: Grafana redirects to {safe_url(authorize_url)}")
+    except Exception:
+        vprint("oauth: Grafana OAuth discovery request failed")
+        authorize_url = ""
+
+    if authorize_url:
+        query = parse_qs(urlparse(authorize_url).query)
+        if not client_id:
+            client_id = (query.get("client_id") or [""])[0]
+        scope = (query.get("scope") or [scope])[0]
+        if not issuer:
+            issuer = issuer_from_authorize_url(authorize_url)
+
+    if not issuer:
+        raise UserError("could not discover OAuth issuer; set --oauth-issuer")
+    if not client_id:
+        raise UserError("could not discover OAuth client ID; set --oauth-client-id")
+
+    discovery_url = f"{issuer}/.well-known/openid-configuration"
+    vprint(f"oauth: issuer={issuer} client_id={client_id} scope={scope!r}")
+    vprint(f"oauth: loading OIDC discovery from {discovery_url}")
+    try:
+        async with session.get(discovery_url, allow_redirects=True) as resp:
+            vprint(f"oauth: OIDC discovery returned HTTP {resp.status}")
+            if resp.status < 400:
+                data = await resp.json()
+            else:
+                data = {}
+    except Exception as exc:
+        vprint(f"oauth: OIDC discovery failed: {exc}")
+        data = {}
+
+    config = {
+        "issuer": issuer,
+        "client_id": client_id,
+        "scope": scope,
+        "authorization_endpoint": data.get(
+            "authorization_endpoint",
+            f"{issuer}/protocol/openid-connect/auth",
+        ),
+        "token_endpoint": data.get(
+            "token_endpoint",
+            f"{issuer}/protocol/openid-connect/token",
+        ),
+    }
+    vprint(f"oauth: authorization endpoint {safe_url(config['authorization_endpoint'])}")
+    vprint(f"oauth: token endpoint {safe_url(config['token_endpoint'])}")
+    return config
+
+
+def pkce_challenge(verifier):
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+async def start_oauth_callback():
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+
+    async def handle_callback(request):
+        if not future.done():
+            future.set_result(dict(request.query))
+        body = (
+            "<!doctype html><html><head><title>logcli-bridge</title></head>"
+            "<body>OAuth complete. You can close this window.</body></html>"
+        )
+        return web.Response(text=body, content_type="text/html")
+
+    app = web.Application()
+    app.router.add_route("*", "/{tail:.*}", handle_callback)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    sockets = list(site._server.sockets)
+    if not sockets:
+        await runner.cleanup()
+        raise UserError("OAuth callback did not open a listening socket")
+    port = sockets[0].getsockname()[1]
+    vprint(f"oauth: localhost callback listening on 127.0.0.1:{port}")
+    return runner, f"http://127.0.0.1:{port}/callback", future
+
+
+def open_oauth_url(url):
+    if not OAUTH_NO_BROWSER:
+        opener = shutil.which("xdg-open")
+        if opener:
+            try:
+                vprint(f"oauth: opening authorization URL with {opener}")
+                subprocess.Popen(
+                    [opener, url],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                return
+            except Exception:
+                pass
+    vprint("oauth: printing authorization URL for manual open")
+    print(f"Open OAuth URL:\n{url}", file=sys.stderr)
+
+
+async def browser_pkce_token(session, config):
+    vprint("oauth: starting browser PKCE authorization")
+    runner, redirect_uri, future = await start_oauth_callback()
+    verifier = secrets.token_urlsafe(64)
+    state = secrets.token_urlsafe(32)
+    nonce = secrets.token_urlsafe(32)
+    params = {
+        "client_id": config["client_id"],
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": config["scope"],
+        "state": state,
+        "nonce": nonce,
+        "code_challenge": pkce_challenge(verifier),
+        "code_challenge_method": "S256",
+    }
+    authorize_url = f"{config['authorization_endpoint']}?{urlencode(params)}"
+
+    try:
+        open_oauth_url(authorize_url)
+        vprint("oauth: waiting for localhost callback")
+        query = await asyncio.wait_for(future, timeout=300)
+    finally:
+        await runner.cleanup()
+
+    vprint(
+        "oauth: callback received "
+        f"code={'yes' if query.get('code') else 'no'} error={'yes' if query.get('error') else 'no'}"
+    )
+    if query.get("state") != state:
+        raise UserError("OAuth callback state mismatch")
+    if query.get("error"):
+        detail = query.get("error_description") or query["error"]
+        raise UserError(f"OAuth callback failed: {detail}")
+    code = query.get("code")
+    if not code:
+        raise UserError("OAuth callback did not include a code")
+
+    data = {
+        "grant_type": "authorization_code",
+        "client_id": config["client_id"],
+        "code": code,
+        "redirect_uri": redirect_uri,
+        "code_verifier": verifier,
+    }
+    vprint("oauth: exchanging authorization code for tokens")
+    async with session.post(config["token_endpoint"], data=data) as resp:
+        text = await resp.text()
+        vprint(f"oauth: token endpoint returned HTTP {resp.status}")
+        if resp.status >= 400:
+            if resp.status == 401 and (
+                "unauthorized_client" in text or "Invalid client credentials" in text
+            ):
+                raise BearerUnavailable(
+                    "OAuth client requires credentials; direct localhost token flow is unavailable"
+                )
+            raise UserError(f"OAuth token exchange failed ({resp.status}): {text[:300]}")
+        token = json.loads(text)
+    if not token.get("access_token"):
+        raise UserError("OAuth token response did not include access_token")
+    vprint(
+        "oauth: token response received "
+        f"access_token=yes refresh_token={'yes' if token.get('refresh_token') else 'no'}"
+    )
+    return token
+
+
+async def grafana_accepts_bearer(session, auth):
+    try:
+        async with session.get(f"{GRAFANA_URL}/api/user", headers=auth_headers(auth)) as resp:
+            vprint(f"oauth: Grafana bearer probe /api/user returned HTTP {resp.status}")
+            if resp.status >= 400:
+                await resp.read()
+                return False
+            data = await resp.json(content_type=None)
+            accepted = isinstance(data, dict) and bool(data.get("id") or data.get("email") or data.get("login"))
+            vprint(f"oauth: Grafana bearer probe accepted={'yes' if accepted else 'no'}")
+            return accepted
+    except Exception as exc:
+        vprint(f"oauth: Grafana bearer probe failed: {exc}")
+        return False
+
+
+class FormParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.forms = []
+        self.current = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "form":
+            self.current = {
+                "action": attrs.get("action", ""),
+                "method": attrs.get("method", "get").lower(),
+                "inputs": [],
+            }
+            self.forms.append(self.current)
+        elif tag == "input" and self.current is not None:
+            self.current["inputs"].append(attrs)
+
+    def handle_endtag(self, tag):
+        if tag == "form":
+            self.current = None
+
+
+def parse_forms(html):
+    parser = FormParser()
+    parser.feed(html)
+    return parser.forms
+
+
+def form_field_names(form):
+    return {field.get("name", "") for field in form["inputs"] if field.get("name")}
+
+
+def select_auth_form(forms):
+    def score(form):
+        names = form_field_names(form)
+        if "password" in names and "username" in names:
+            return 4
+        if "password" in names:
+            return 3
+        if "otp" in names or "totp" in names:
+            return 2
+        if "username" in names:
+            return 1
+        return 0
+
+    candidates = [(score(form), form) for form in forms]
+    candidates = [item for item in candidates if item[0] > 0]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def prompt_tty(prompt, secret=False):
+    try:
+        with open("/dev/tty", "r+", encoding="utf-8") as tty:
+            print(prompt, end="", file=tty, flush=True)
+            if not secret:
+                return tty.readline().rstrip("\n")
+
+            fd = tty.fileno()
+            old_attrs = termios.tcgetattr(fd)
+            try:
+                new_attrs = old_attrs[:]
+                new_attrs[3] &= ~termios.ECHO
+                termios.tcsetattr(fd, termios.TCSADRAIN, new_attrs)
+                return tty.readline().rstrip("\n")
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+                print("", file=tty, flush=True)
+    except OSError as exc:
+        raise UserError("interactive OAuth prompts require a terminal (/dev/tty)") from exc
+
+
+def form_payload(form, username):
+    payload = {}
+    otp_fields = []
+    has_password = False
+    for field in form["inputs"]:
+        name = field.get("name")
+        if not name:
+            continue
+        field_type = field.get("type", "text").lower()
+        if field_type in ("button", "file", "image", "reset"):
+            continue
+        if field_type in ("checkbox", "radio") and "checked" not in field and name != "rememberMe":
+            continue
+        payload[name] = field.get("value", "")
+        if name == "username":
+            if not username:
+                username = prompt_tty("OAuth username: ")
+            payload[name] = username
+        elif name == "password":
+            has_password = True
+        elif name in ("otp", "totp"):
+            otp_fields.append(name)
+
+    if has_password:
+        vprint("oauth-form: password field found")
+        payload["password"] = prompt_tty("OAuth password: ", secret=True)
+    for name in otp_fields:
+        vprint(f"oauth-form: OTP field found: {name}")
+        payload[name] = prompt_tty("OAuth OTP: ")
+    return payload, username
+
+
+def browserish_headers(url, method):
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": "Mozilla/5.0 logcli-bridge",
+    }
+    if method.upper() == "POST":
+        headers["Origin"] = origin_from_url(url)
+    return headers
+
+
+def grafana_session_cookie_from_jar(session):
+    cookies = session.cookie_jar.filter_cookies(URL(GRAFANA_URL))
+    values = {}
+    for name in ("grafana_session", "grafana_session_expiry"):
+        if name in cookies:
+            values[name] = cookies[name].value
+    if "grafana_session" not in values:
+        return None, None
+    expires_at = int(time.time()) + 3600
+    try:
+        expires_at = int(values.get("grafana_session_expiry") or expires_at)
+    except ValueError:
+        pass
+    header = "; ".join(f"{name}={value}" for name, value in values.items())
+    return header, expires_at
+
+
+async def grafana_session_form_auth():
+    timeout = ClientTimeout(total=300, sock_connect=30)
+    async with ClientSession(cookie_jar=CookieJar(unsafe=True), timeout=timeout) as session:
+        url = f"{GRAFANA_URL}/login/generic_oauth"
+        method = "GET"
+        data = None
+        username = OAUTH_USERNAME
+        vprint("oauth-form: starting Grafana session login fallback")
+        for step in range(1, 41):
+            vprint(f"oauth-form: step {step}: {method} {safe_url(url)}")
+            async with session.request(
+                method,
+                url,
+                data=data,
+                headers=browserish_headers(url, method),
+                allow_redirects=False,
+            ) as resp:
+                text = await resp.text()
+                vprint(f"oauth-form: step {step}: HTTP {resp.status} from {safe_url(resp.url)}")
+                cookie, expires_at = grafana_session_cookie_from_jar(session)
+                if cookie:
+                    vprint(f"oauth-form: Grafana session cookie received; expires_at={expires_at}")
+                    return make_cookie_auth(cookie, "oauth-form"), expires_at
+                if 300 <= resp.status < 400:
+                    location = resp.headers.get("Location")
+                    if not location:
+                        raise UserError(f"OAuth redirect from {resp.url} lacked Location")
+                    url = urljoin(str(resp.url), location)
+                    vprint(f"oauth-form: redirect to {safe_url(url)}")
+                    method = "GET"
+                    data = None
+                    continue
+                if resp.status >= 400:
+                    raise UserError(f"OAuth form flow failed ({resp.status}): {text[:300]}")
+
+                form = select_auth_form(parse_forms(text))
+                if not form:
+                    raise UserError(f"OAuth form flow reached unsupported page: {resp.url}")
+                names = sorted(form_field_names(form))
+                vprint(f"oauth-form: selected form fields: {', '.join(names)}")
+                data, username = form_payload(form, username)
+                url = urljoin(str(resp.url), form["action"] or str(resp.url))
+                method = form["method"].upper()
+                if method not in ("GET", "POST"):
+                    method = "POST"
+                vprint(f"oauth-form: submitting form via {method} {safe_url(url)}")
+                if method == "GET":
+                    url = f"{url}?{urlencode(data)}"
+                    data = None
+        raise UserError("OAuth form flow exceeded redirect limit")
+
+
+async def oauth_auth():
+    vprint("oauth: resolving OAuth auth")
+    cached = cached_oauth_auth()
+    if cached:
+        return cached
+
+    async with ClientSession(timeout=ClientTimeout(total=30)) as session:
+        config = await discover_oauth_config(session)
+        try:
+            token = await browser_pkce_token(session, config)
+            auth = make_bearer_auth(token["access_token"], "oauth-bearer")
+            if await grafana_accepts_bearer(session, auth):
+                expires_at = int(time.time()) + int(token.get("expires_in") or 3600)
+                save_oauth_cache(
+                    {
+                        "type": "bearer",
+                        "issuer": config["issuer"],
+                        "client_id": config["client_id"],
+                        "access_token": token["access_token"],
+                        "refresh_token": token.get("refresh_token", ""),
+                        "expires_at": expires_at,
+                    }
+                )
+                vprint(f"oauth: using bearer auth; expires_at={expires_at}")
+                return auth
+            print("WARNING: Grafana rejected bearer token; falling back to Grafana session login", file=sys.stderr)
+        except BearerUnavailable as exc:
+            print(f"WARNING: {exc}; using Grafana session login", file=sys.stderr)
+        except Exception as exc:
+            print(f"WARNING: OAuth bearer flow failed; falling back to Grafana session login: {exc}", file=sys.stderr)
+
+    auth, expires_at = await grafana_session_form_auth()
+    save_oauth_cache(
+        {
+            "type": "cookie",
+            "issuer": config["issuer"],
+            "client_id": config["client_id"],
+            "cookie": auth["cookie"],
+            "expires_at": expires_at,
+        }
+    )
+    vprint(f"oauth: using Grafana session auth; expires_at={expires_at}")
+    return auth
+
+
+async def resolve_auth():
+    if COOKIE:
+        vprint("auth: using explicit cookie")
+        return make_cookie_auth(COOKIE, "cookie")
+    if OAUTH:
+        return await oauth_auth()
+    vprint("auth: using Chrome cookie lookup")
+    return cookie_auth()
+
+
+async def fetch_datasource_uid(session, auth):
     url = f"{GRAFANA_URL}/api/datasources/name/{quote(DATASOURCE, safe='')}"
-    async with session.get(url, headers={"Cookie": cookie}) as resp:
+    async with session.get(url, headers=auth_headers(auth)) as resp:
         text = await resp.text()
         if resp.status in (401, 403):
-            raise UserError(f"Grafana rejected cookie ({resp.status}); log in again or set GRAFANA_COOKIE")
+            raise UserError(f"Grafana rejected auth ({resp.status}); log in again")
         if resp.status >= 400:
             raise UserError(f"Grafana datasource lookup failed ({resp.status}): {text[:200]}")
         data = json.loads(text)
@@ -482,7 +1082,7 @@ def tail_query_from_logcli_args(args):
     return None
 
 
-async def validate_tail_query(session, cookie, uid, query):
+async def validate_tail_query(session, auth, uid, query):
     if not query:
         return
     now_ns = time.time_ns()
@@ -498,7 +1098,7 @@ async def validate_tail_query(session, cookie, uid, query):
         f"{GRAFANA_URL}/api/datasources/proxy/uid/{quote(uid, safe='')}"
         f"/loki/api/v1/query_range?{params}"
     )
-    async with session.get(url, headers={"Cookie": cookie}) as resp:
+    async with session.get(url, headers=auth_headers(auth)) as resp:
         text = await resp.text()
         if resp.status < 400:
             return
@@ -510,7 +1110,7 @@ async def validate_tail_query(session, cookie, uid, query):
         raise UserError(f"tail query validation failed ({resp.status}): {message.strip()[:500]}")
 
 
-def copy_request_headers(request, cookie):
+def copy_request_headers(request, auth):
     hop_by_hop = {
         "connection",
         "keep-alive",
@@ -529,7 +1129,7 @@ def copy_request_headers(request, cookie):
         for key, value in request.headers.items()
         if key.lower() not in hop_by_hop
     }
-    headers["Cookie"] = cookie
+    headers.update(auth_headers(auth))
     headers["Origin"] = origin_from_url(GRAFANA_URL)
     return headers
 
@@ -550,7 +1150,7 @@ def upstream_ws_url(uid, request):
 
 async def handle_http(request):
     app = request.app
-    cookie = app["cookie"]
+    auth = app["auth"]
     uid = app["uid"]
     session = app["session"]
 
@@ -558,7 +1158,7 @@ async def handle_http(request):
         return await handle_ws(request)
 
     body = await request.read()
-    headers = copy_request_headers(request, cookie)
+    headers = copy_request_headers(request, auth)
     async with session.request(
         request.method,
         upstream_http_url(uid, request),
@@ -616,17 +1216,15 @@ async def pump_ws_to_local(upstream_ws, local_ws):
 
 async def handle_ws(request):
     app = request.app
-    cookie = app["cookie"]
+    auth = app["auth"]
     uid = app["uid"]
     session = app["session"]
 
     local_ws = web.WebSocketResponse()
     await local_ws.prepare(request)
 
-    headers = {
-        "Cookie": cookie,
-        "Origin": origin_from_url(GRAFANA_URL),
-    }
+    headers = auth_headers(auth)
+    headers["Origin"] = origin_from_url(GRAFANA_URL)
     try:
         async with session.ws_connect(upstream_ws_url(uid, request), headers=headers, heartbeat=30) as upstream_ws:
             tasks = [
@@ -644,11 +1242,11 @@ async def handle_ws(request):
     return local_ws
 
 
-async def start_server(cookie, uid):
+async def start_server(auth, uid):
     timeout = ClientTimeout(total=None, sock_connect=30)
     session = ClientSession(timeout=timeout)
     app = web.Application()
-    app["cookie"] = cookie
+    app["auth"] = auth
     app["uid"] = uid
     app["session"] = session
     app.router.add_route("*", "/{tail:.*}", handle_http)
@@ -683,14 +1281,15 @@ async def run_logcli(port):
 
 async def main():
     try:
-        cookie = cookie_header()
+        auth = await resolve_auth()
         async with ClientSession(timeout=ClientTimeout(total=30)) as session:
-            uid = await fetch_datasource_uid(session, cookie)
-            await validate_tail_query(session, cookie, uid, tail_query_from_logcli_args(LOGCLI_ARGS))
-        runner, session, port = await start_server(cookie, uid)
+            uid = await fetch_datasource_uid(session, auth)
+            await validate_tail_query(session, auth, uid, tail_query_from_logcli_args(LOGCLI_ARGS))
+        runner, session, port = await start_server(auth, uid)
         if VERBOSE:
             print(f"logcli-bridge: Grafana URL: {GRAFANA_URL}", file=sys.stderr)
             print(f"logcli-bridge: datasource {DATASOURCE!r} uid: {uid}", file=sys.stderr)
+            print(f"logcli-bridge: auth source: {auth['source']} ({auth['type']})", file=sys.stderr)
             print(f"logcli-bridge: local URL: http://{LISTEN_HOST}:{port}", file=sys.stderr)
     except UserError as exc:
         fail(str(exc))
