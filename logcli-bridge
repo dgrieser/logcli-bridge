@@ -14,6 +14,8 @@ Wrapper options:
   --datasource NAME       Grafana datasource name (default: Loki)
   --oauth                 Log in through OAuth instead of Chrome cookies
   --oauth-cache PATH      OAuth cache path (default: ~/.cache/logcli-bridge/session.json)
+  --oauth-login-path PATH Grafana OAuth login path (default: /login/generic_oauth)
+  --oauth-bearer-probe    Try localhost PKCE bearer auth before Grafana session auth
   --oauth-issuer URL      OAuth issuer override
   --oauth-client-id ID    OAuth client ID override
   --oauth-no-browser      Print OAuth URL instead of opening xdg-open
@@ -30,10 +32,14 @@ Environment:
   LOGCLI_BRIDGE_DATASOURCE      Same as --datasource
   LOGCLI_BRIDGE_OAUTH           Same as --oauth when set to 1
   LOGCLI_BRIDGE_OAUTH_CACHE     Same as --oauth-cache
+  LOGCLI_BRIDGE_OAUTH_LOGIN_PATH Same as --oauth-login-path
+  LOGCLI_BRIDGE_OAUTH_BEARER_PROBE  Same as --oauth-bearer-probe when set to 1
   LOGCLI_BRIDGE_OAUTH_ISSUER    Same as --oauth-issuer
   LOGCLI_BRIDGE_OAUTH_CLIENT_ID Same as --oauth-client-id
   LOGCLI_BRIDGE_OAUTH_NO_BROWSER  Same as --oauth-no-browser when set to 1
   LOGCLI_BRIDGE_OAUTH_USERNAME  Same as --oauth-username
+  LOGCLI_BRIDGE_OAUTH_PASSWORD  Password for OAuth form fallback
+  LOGCLI_BRIDGE_OAUTH_OTP       OTP for OAuth form fallback
   LOGCLI_BRIDGE_COOKIE          Same as --cookie
   LOGCLI_BRIDGE_CHROME_COOKIES  Same as --chrome-cookies
 
@@ -74,10 +80,14 @@ grafana_host_arg="${LOGCLI_BRIDGE_HOST:-}"
 datasource="${LOGCLI_BRIDGE_DATASOURCE:-${GRAFANA_DATASOURCE:-Loki}}"
 oauth="${LOGCLI_BRIDGE_OAUTH:-0}"
 oauth_cache="${LOGCLI_BRIDGE_OAUTH_CACHE:-${XDG_CACHE_HOME:-${HOME}/.cache}/logcli-bridge/session.json}"
+oauth_login_path="${LOGCLI_BRIDGE_OAUTH_LOGIN_PATH:-/login/generic_oauth}"
+oauth_bearer_probe="${LOGCLI_BRIDGE_OAUTH_BEARER_PROBE:-0}"
 oauth_issuer="${LOGCLI_BRIDGE_OAUTH_ISSUER:-}"
 oauth_client_id="${LOGCLI_BRIDGE_OAUTH_CLIENT_ID:-}"
 oauth_no_browser="${LOGCLI_BRIDGE_OAUTH_NO_BROWSER:-0}"
 oauth_username="${LOGCLI_BRIDGE_OAUTH_USERNAME:-}"
+oauth_password="${LOGCLI_BRIDGE_OAUTH_PASSWORD:-}"
+oauth_otp="${LOGCLI_BRIDGE_OAUTH_OTP:-}"
 chrome_cookies="${LOGCLI_BRIDGE_CHROME_COOKIES:-${CHROME_COOKIES:-${HOME}/.config/google-chrome/Default/Cookies}}"
 cookie="${LOGCLI_BRIDGE_COOKIE:-${GRAFANA_COOKIE:-}}"
 listen_host="127.0.0.1"
@@ -107,6 +117,14 @@ while [ "${#}" -gt 0 ]; do
             shift
             [ -z "${1}" ] && usage
             oauth_cache="${1}"
+            ;;
+        --oauth-login-path)
+            shift
+            [ -z "${1}" ] && usage
+            oauth_login_path="${1}"
+            ;;
+        --oauth-bearer-probe)
+            oauth_bearer_probe="1"
             ;;
         --oauth-issuer)
             shift
@@ -185,15 +203,25 @@ export LOGCLI_BRIDGE_GRAFANA_URL="${grafana_url}"
 export LOGCLI_BRIDGE_DATASOURCE="${datasource}"
 export LOGCLI_BRIDGE_OAUTH="${oauth}"
 export LOGCLI_BRIDGE_OAUTH_CACHE="${oauth_cache}"
+export LOGCLI_BRIDGE_OAUTH_LOGIN_PATH="${oauth_login_path}"
+export LOGCLI_BRIDGE_OAUTH_BEARER_PROBE="${oauth_bearer_probe}"
 export LOGCLI_BRIDGE_OAUTH_ISSUER="${oauth_issuer}"
 export LOGCLI_BRIDGE_OAUTH_CLIENT_ID="${oauth_client_id}"
 export LOGCLI_BRIDGE_OAUTH_NO_BROWSER="${oauth_no_browser}"
 export LOGCLI_BRIDGE_OAUTH_USERNAME="${oauth_username}"
+export LOGCLI_BRIDGE_OAUTH_PASSWORD="${oauth_password}"
+export LOGCLI_BRIDGE_OAUTH_OTP="${oauth_otp}"
 export LOGCLI_BRIDGE_CHROME_COOKIES="${chrome_cookies}"
 export LOGCLI_BRIDGE_COOKIE="${cookie}"
 export LOGCLI_BRIDGE_LISTEN_HOST="${listen_host}"
 export LOGCLI_BRIDGE_LISTEN_PORT="${listen_port}"
 export LOGCLI_BRIDGE_VERBOSE="${verbose}"
+
+if exec 3<&0; then
+    export LOGCLI_BRIDGE_INPUT_FD="3"
+else
+    export LOGCLI_BRIDGE_INPUT_FD=""
+fi
 
 exec python3 - "${logcli_args[@]}" <<'PY'
 import asyncio
@@ -235,10 +263,22 @@ GRAFANA_URL = os.environ["LOGCLI_BRIDGE_GRAFANA_URL"].rstrip("/")
 DATASOURCE = os.environ["LOGCLI_BRIDGE_DATASOURCE"]
 OAUTH = os.environ.get("LOGCLI_BRIDGE_OAUTH", "0").lower() in ("1", "true", "yes", "on")
 OAUTH_CACHE = os.environ["LOGCLI_BRIDGE_OAUTH_CACHE"]
+OAUTH_LOGIN_PATH = os.environ.get("LOGCLI_BRIDGE_OAUTH_LOGIN_PATH", "/login/generic_oauth")
+if not OAUTH_LOGIN_PATH.startswith("/"):
+    OAUTH_LOGIN_PATH = "/" + OAUTH_LOGIN_PATH
+OAUTH_BEARER_PROBE = os.environ.get("LOGCLI_BRIDGE_OAUTH_BEARER_PROBE", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 OAUTH_ISSUER = os.environ.get("LOGCLI_BRIDGE_OAUTH_ISSUER", "").rstrip("/")
 OAUTH_CLIENT_ID = os.environ.get("LOGCLI_BRIDGE_OAUTH_CLIENT_ID", "")
 OAUTH_NO_BROWSER = os.environ.get("LOGCLI_BRIDGE_OAUTH_NO_BROWSER", "0").lower() in ("1", "true", "yes", "on")
 OAUTH_USERNAME = os.environ.get("LOGCLI_BRIDGE_OAUTH_USERNAME", "")
+OAUTH_PASSWORD = os.environ.get("LOGCLI_BRIDGE_OAUTH_PASSWORD", "")
+OAUTH_OTP = os.environ.get("LOGCLI_BRIDGE_OAUTH_OTP", "")
+INPUT_FD = os.environ.get("LOGCLI_BRIDGE_INPUT_FD", "")
 COOKIE = os.environ.get("LOGCLI_BRIDGE_COOKIE", "")
 CHROME_COOKIES = os.environ["LOGCLI_BRIDGE_CHROME_COOKIES"]
 LISTEN_HOST = os.environ["LOGCLI_BRIDGE_LISTEN_HOST"]
@@ -524,9 +564,9 @@ async def discover_oauth_config(session):
     issuer = OAUTH_ISSUER
     scope = "openid email profile offline_access roles"
 
-    vprint("oauth: discovering config from Grafana /login/generic_oauth")
+    vprint(f"oauth: discovering config from Grafana {OAUTH_LOGIN_PATH}")
     try:
-        async with session.get(f"{GRAFANA_URL}/login/generic_oauth", allow_redirects=False) as resp:
+        async with session.get(f"{GRAFANA_URL}{OAUTH_LOGIN_PATH}", allow_redirects=False) as resp:
             location = resp.headers.get("Location", "")
             vprint(f"oauth: Grafana OAuth start returned HTTP {resp.status}")
             if 300 <= resp.status < 400 and location:
@@ -770,25 +810,51 @@ def select_auth_form(forms):
     return candidates[0][1]
 
 
-def prompt_tty(prompt, secret=False):
+def read_line_fd(fd):
+    chunks = []
+    while True:
+        try:
+            data = os.read(fd, 1)
+        except OSError as exc:
+            raise UserError("interactive OAuth prompt input failed") from exc
+        if data == b"":
+            raise UserError("interactive OAuth prompt input ended unexpectedly")
+        if data == b"\n":
+            break
+        chunks.append(data)
+    return b"".join(chunks).decode("utf-8", "replace").rstrip("\r")
+
+
+def prompt_from_fd(fd, writer, prompt, secret=False):
+    print(prompt, end="", file=writer, flush=True)
+    old_attrs = None
+    try:
+        if secret and os.isatty(fd):
+            old_attrs = termios.tcgetattr(fd)
+            new_attrs = old_attrs[:]
+            new_attrs[3] &= ~termios.ECHO
+            termios.tcsetattr(fd, termios.TCSADRAIN, new_attrs)
+        return read_line_fd(fd)
+    finally:
+        if old_attrs is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+            print("", file=writer, flush=True)
+
+
+def prompt_input(prompt, secret=False):
     try:
         with open("/dev/tty", "r+", encoding="utf-8") as tty:
-            print(prompt, end="", file=tty, flush=True)
-            if not secret:
-                return tty.readline().rstrip("\n")
+            return prompt_from_fd(tty.fileno(), tty, prompt, secret)
+    except OSError:
+        pass
 
-            fd = tty.fileno()
-            old_attrs = termios.tcgetattr(fd)
-            try:
-                new_attrs = old_attrs[:]
-                new_attrs[3] &= ~termios.ECHO
-                termios.tcsetattr(fd, termios.TCSADRAIN, new_attrs)
-                return tty.readline().rstrip("\n")
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
-                print("", file=tty, flush=True)
-    except OSError as exc:
-        raise UserError("interactive OAuth prompts require a terminal (/dev/tty)") from exc
+    if INPUT_FD:
+        try:
+            return prompt_from_fd(int(INPUT_FD), sys.stderr, prompt, secret)
+        except (OSError, ValueError) as exc:
+            raise UserError("interactive OAuth prompts require a terminal or readable stdin") from exc
+
+    raise UserError("interactive OAuth prompts require a terminal or readable stdin")
 
 
 def form_payload(form, username):
@@ -807,7 +873,7 @@ def form_payload(form, username):
         payload[name] = field.get("value", "")
         if name == "username":
             if not username:
-                username = prompt_tty("OAuth username: ")
+                username = prompt_input("OAuth username: ")
             payload[name] = username
         elif name == "password":
             has_password = True
@@ -816,10 +882,10 @@ def form_payload(form, username):
 
     if has_password:
         vprint("oauth-form: password field found")
-        payload["password"] = prompt_tty("OAuth password: ", secret=True)
+        payload["password"] = OAUTH_PASSWORD or prompt_input("OAuth password: ", secret=True)
     for name in otp_fields:
         vprint(f"oauth-form: OTP field found: {name}")
-        payload[name] = prompt_tty("OAuth OTP: ")
+        payload[name] = OAUTH_OTP or prompt_input("OAuth OTP: ")
     return payload, username
 
 
@@ -853,7 +919,7 @@ def grafana_session_cookie_from_jar(session):
 async def grafana_session_form_auth():
     timeout = ClientTimeout(total=300, sock_connect=30)
     async with ClientSession(cookie_jar=CookieJar(unsafe=True), timeout=timeout) as session:
-        url = f"{GRAFANA_URL}/login/generic_oauth"
+        url = f"{GRAFANA_URL}{OAUTH_LOGIN_PATH}"
         method = "GET"
         data = None
         username = OAUTH_USERNAME
@@ -910,28 +976,31 @@ async def oauth_auth():
 
     async with ClientSession(timeout=ClientTimeout(total=30)) as session:
         config = await discover_oauth_config(session)
-        try:
-            token = await browser_pkce_token(session, config)
-            auth = make_bearer_auth(token["access_token"], "oauth-bearer")
-            if await grafana_accepts_bearer(session, auth):
-                expires_at = int(time.time()) + int(token.get("expires_in") or 3600)
-                save_oauth_cache(
-                    {
-                        "type": "bearer",
-                        "issuer": config["issuer"],
-                        "client_id": config["client_id"],
-                        "access_token": token["access_token"],
-                        "refresh_token": token.get("refresh_token", ""),
-                        "expires_at": expires_at,
-                    }
-                )
-                vprint(f"oauth: using bearer auth; expires_at={expires_at}")
-                return auth
-            print("WARNING: Grafana rejected bearer token; falling back to Grafana session login", file=sys.stderr)
-        except BearerUnavailable as exc:
-            print(f"WARNING: {exc}; using Grafana session login", file=sys.stderr)
-        except Exception as exc:
-            print(f"WARNING: OAuth bearer flow failed; falling back to Grafana session login: {exc}", file=sys.stderr)
+        if OAUTH_BEARER_PROBE:
+            try:
+                token = await browser_pkce_token(session, config)
+                auth = make_bearer_auth(token["access_token"], "oauth-bearer")
+                if await grafana_accepts_bearer(session, auth):
+                    expires_at = int(time.time()) + int(token.get("expires_in") or 3600)
+                    save_oauth_cache(
+                        {
+                            "type": "bearer",
+                            "issuer": config["issuer"],
+                            "client_id": config["client_id"],
+                            "access_token": token["access_token"],
+                            "refresh_token": token.get("refresh_token", ""),
+                            "expires_at": expires_at,
+                        }
+                    )
+                    vprint(f"oauth: using bearer auth; expires_at={expires_at}")
+                    return auth
+                print("WARNING: Grafana rejected bearer token; falling back to Grafana session login", file=sys.stderr)
+            except BearerUnavailable as exc:
+                print(f"WARNING: {exc}; using Grafana session login", file=sys.stderr)
+            except Exception as exc:
+                print(f"WARNING: OAuth bearer flow failed; falling back to Grafana session login: {exc}", file=sys.stderr)
+        else:
+            vprint("oauth: skipping localhost bearer probe; using Grafana session login")
 
     auth, expires_at = await grafana_session_form_auth()
     save_oauth_cache(
