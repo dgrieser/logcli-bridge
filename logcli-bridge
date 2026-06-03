@@ -6,12 +6,20 @@ usage() {
     cat <<EOF 1>&2
 usage: ${APP_NAME} --host HOST [WRAPPER_OPTIONS] -- LOGCLI_ARGS...
        ${APP_NAME} --host HOST [WRAPPER_OPTIONS] LOGCLI_ARGS...
+       ${APP_NAME} --kube [WRAPPER_OPTIONS] LOGCLI_ARGS...
 
-Run logcli against Loki through Grafana's authenticated datasource proxy.
+Run logcli against Loki through Grafana's authenticated datasource proxy,
+or directly against an in-cluster Loki via kubectl port-forward (--kube).
 
 Wrapper options:
   -H, --host HOST         Grafana host or URL, for example grafana.example.com
   --datasource NAME       Grafana datasource name (default: Loki)
+  --kube                  Connect to Loki via kubectl port-forward, bypassing Grafana
+  --kube-namespace NS     Kubernetes namespace for Loki (default: monitoring)
+  --kube-service NAME     Loki target: NAME, svc/NAME, or pod/NAME (default: loki)
+  --kube-port PORT        Loki remote port to forward (default: 3100)
+  --kube-context CTX      kubectl context override
+                          In --kube mode the Grafana/OAuth/cookie options are ignored.
   --oauth                 Log in through OAuth (default unless --cookie or --no-oauth is set)
   --no-oauth              Disable default OAuth and use Chrome cookies
   --oauth-cache PATH      OAuth cache path (default: ~/.cache/logcli-bridge/session.json)
@@ -31,6 +39,11 @@ Wrapper options:
 Environment:
   LOGCLI_BRIDGE_HOST            Same as --host
   LOGCLI_BRIDGE_DATASOURCE      Same as --datasource
+  LOGCLI_BRIDGE_KUBE            Set to 1 to use kubectl port-forward (same as --kube)
+  LOGCLI_BRIDGE_KUBE_NAMESPACE  Same as --kube-namespace
+  LOGCLI_BRIDGE_KUBE_SERVICE    Same as --kube-service
+  LOGCLI_BRIDGE_KUBE_PORT       Same as --kube-port
+  LOGCLI_BRIDGE_KUBE_CONTEXT    Same as --kube-context
   LOGCLI_BRIDGE_OAUTH           Set to 0 to disable default OAuth
   LOGCLI_BRIDGE_OAUTH_CACHE     Same as --oauth-cache
   LOGCLI_BRIDGE_OAUTH_LOGIN_PATH Same as --oauth-login-path
@@ -48,6 +61,8 @@ Examples:
   ${APP_NAME} --host grafana.example.com labels
   ${APP_NAME} -H grafana.example.com query --since=1h --limit=100 '{namespace="monitoring"}'
   ${APP_NAME} -H grafana.example.com query --tail '{namespace="monitoring"}'
+  ${APP_NAME} --kube labels
+  ${APP_NAME} --kube query --since=1h --limit=100 '{namespace="monitoring"}'
 EOF
     exit 1
 }
@@ -77,8 +92,89 @@ abort() {
     exit 1
 }
 
+run_kube_bridge() {
+    command -v kubectl >/dev/null 2>&1 || fail "kubectl not found in PATH"
+
+    local kube_target
+    case "${kube_service}" in
+        */*) kube_target="${kube_service}" ;;
+        *)   kube_target="svc/${kube_service}" ;;
+    esac
+
+    local kube_cmd=(kubectl)
+    [ -n "${kube_context}" ] && kube_cmd+=(--context "${kube_context}")
+    kube_cmd+=(-n "${kube_namespace}")
+
+    local address_arg=()
+    if [ -n "${listen_host}" ] && [ "${listen_host}" != "127.0.0.1" ]; then
+        address_arg+=(--address "${listen_host}")
+    fi
+
+    local spec
+    if [ -z "${listen_port}" ] || [ "${listen_port}" = "0" ]; then
+        spec=":${kube_remote_port}"
+    else
+        spec="${listen_port}:${kube_remote_port}"
+    fi
+
+    local pf_log
+    pf_log="$(mktemp -t logcli-bridge-pf.XXXXXX)"
+
+    "${kube_cmd[@]}" port-forward "${kube_target}" "${address_arg[@]}" "${spec}" >"${pf_log}" 2>&1 &
+    local pf_pid=$!
+
+    kube_cleanup() {
+        kill "${pf_pid}" 2>/dev/null
+        wait "${pf_pid}" 2>/dev/null
+        rm -f "${pf_log}"
+    }
+    trap kube_cleanup EXIT INT TERM
+
+    local local_port="" i
+    for i in $(seq 1 100); do
+        if ! kill -0 "${pf_pid}" 2>/dev/null; then
+            error "kubectl port-forward exited before it was ready"
+            cat "${pf_log}" 1>&2
+            exit 1
+        fi
+        local_port="$(sed -n 's/^Forwarding from [^:]*:\([0-9][0-9]*\) ->.*/\1/p' "${pf_log}" | head -n1)"
+        [ -n "${local_port}" ] && break
+        sleep 0.1
+    done
+    if [ -z "${local_port}" ]; then
+        error "timed out waiting for kubectl port-forward"
+        cat "${pf_log}" 1>&2
+        exit 1
+    fi
+
+    local bind_host="${listen_host:-127.0.0.1}"
+    if [ "${verbose}" = "1" ]; then
+        echo "logcli-bridge: kube target: ${kube_namespace}/${kube_target} (remote :${kube_remote_port})" 1>&2
+        echo "logcli-bridge: local URL: http://${bind_host}:${local_port}" 1>&2
+    fi
+
+    local logcli_cmd=(logcli "--addr=http://${bind_host}:${local_port}")
+    [ "${verbose}" != "1" ] && logcli_cmd+=(--quiet)
+    logcli_cmd+=("${logcli_args[@]}")
+    "${logcli_cmd[@]}"
+    local rc=$?
+
+    kube_cleanup
+    trap - EXIT INT TERM
+    exit "${rc}"
+}
+
 grafana_host_arg="${LOGCLI_BRIDGE_HOST:-}"
 datasource="${LOGCLI_BRIDGE_DATASOURCE:-${GRAFANA_DATASOURCE:-Loki}}"
+kube="${LOGCLI_BRIDGE_KUBE:-0}"
+kube_namespace="${LOGCLI_BRIDGE_KUBE_NAMESPACE:-monitoring}"
+kube_service="${LOGCLI_BRIDGE_KUBE_SERVICE:-loki}"
+kube_remote_port="${LOGCLI_BRIDGE_KUBE_PORT:-3100}"
+kube_context="${LOGCLI_BRIDGE_KUBE_CONTEXT:-}"
+case "${kube}" in
+    1|true|yes|on|TRUE|True|YES|ON) kube="1" ;;
+    *) kube="0" ;;
+esac
 oauth="${LOGCLI_BRIDGE_OAUTH:-1}"
 oauth_cache="${LOGCLI_BRIDGE_OAUTH_CACHE:-${XDG_CACHE_HOME:-${HOME}/.cache}/logcli-bridge/session.json}"
 oauth_login_path="${LOGCLI_BRIDGE_OAUTH_LOGIN_PATH:-/login/generic_oauth}"
@@ -110,6 +206,29 @@ while [ "${#}" -gt 0 ]; do
             shift
             [ -z "${1}" ] && usage
             datasource="${1}"
+            ;;
+        --kube|--kube-proxy)
+            kube="1"
+            ;;
+        --kube-namespace)
+            shift
+            [ -z "${1}" ] && usage
+            kube_namespace="${1}"
+            ;;
+        --kube-service)
+            shift
+            [ -z "${1}" ] && usage
+            kube_service="${1}"
+            ;;
+        --kube-port)
+            shift
+            [ -z "${1}" ] && usage
+            kube_remote_port="${1}"
+            ;;
+        --kube-context)
+            shift
+            [ -z "${1}" ] && usage
+            kube_context="${1}"
             ;;
         --oauth)
             oauth="1"
@@ -173,7 +292,7 @@ while [ "${#}" -gt 0 ]; do
             ;;
         --)
             shift
-            [ -z "${grafana_host_arg}" ] && usage
+            [ -z "${grafana_host_arg}" ] && [ "${kube}" != "1" ] && usage
             logcli_args=("${@}")
             break
             ;;
@@ -185,13 +304,18 @@ while [ "${#}" -gt 0 ]; do
     shift
 done
 
+[ "${#logcli_args[@]}" -eq 0 ] && usage
+command -v logcli >/dev/null 2>&1 || fail "logcli not found in PATH"
+
+if [ "${kube}" = "1" ]; then
+    run_kube_bridge
+fi
+
 if [ -z "${grafana_host_arg}" ]; then
     grafana_host_arg="$(discover_grafana_host)"
 fi
 
 [ -z "${grafana_host_arg}" ] && usage
-[ "${#logcli_args[@]}" -eq 0 ] && usage
-command -v logcli >/dev/null 2>&1 || fail "logcli not found in PATH"
 command -v python3 >/dev/null 2>&1 || fail "python3 not found in PATH"
 
 case "${grafana_host_arg}" in
