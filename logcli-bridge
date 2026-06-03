@@ -19,9 +19,17 @@ Wrapper options:
   --kube-service NAME     Loki target: NAME, svc/NAME, or pod/NAME (default: loki)
   --kube-port PORT        Loki remote port to forward (default: 3100)
   --kube-context CTX      kubectl context override
-                          In --kube mode the Grafana/OAuth/cookie options are ignored.
-  --oauth                 Log in through OAuth (default unless --cookie or --no-oauth is set)
-  --no-oauth              Disable default OAuth and use Chrome cookies
+                          In --kube mode the Grafana/auth options are ignored.
+
+Authentication (pick one; default is OAuth login):
+  (default)               Log in through OAuth
+  --chrome-cookie-hijack  Authenticate with grafana_session cookies read from
+                          Chrome's cookie store instead of OAuth
+  --chrome-cookies PATH   Chrome Cookies sqlite DB path (for --chrome-cookie-hijack)
+  --cookie COOKIE         Authenticate with an explicit Grafana Cookie header
+                          value (also via LOGCLI_BRIDGE_COOKIE/GRAFANA_COOKIE)
+
+OAuth options:
   --oauth-cache PATH      OAuth cache path (default: ~/.cache/logcli-bridge/session.json)
   --oauth-login-path PATH Grafana OAuth login path (default: /login/generic_oauth)
   --oauth-bearer-probe    Try localhost PKCE bearer auth before Grafana session auth
@@ -29,8 +37,8 @@ Wrapper options:
   --oauth-client-id ID    OAuth client ID override
   --oauth-no-browser      Print OAuth URL instead of opening xdg-open
   --oauth-username NAME   Username for OAuth form fallback
-  --chrome-cookies PATH   Chrome Cookies sqlite DB path
-  --cookie COOKIE         Grafana Cookie header value
+
+Other options:
   --listen HOST           Local shim host (default: 127.0.0.1)
   --port PORT             Local shim port (default: random free port)
   --verbose               Print bridge target info and logcli request URLs
@@ -44,7 +52,7 @@ Environment:
   LOGCLI_BRIDGE_KUBE_SERVICE    Same as --kube-service
   LOGCLI_BRIDGE_KUBE_PORT       Same as --kube-port
   LOGCLI_BRIDGE_KUBE_CONTEXT    Same as --kube-context
-  LOGCLI_BRIDGE_OAUTH           Set to 0 to disable default OAuth
+  LOGCLI_BRIDGE_CHROME_COOKIE_HIJACK  Set to 1 to use Chrome cookies (same as --chrome-cookie-hijack)
   LOGCLI_BRIDGE_OAUTH_CACHE     Same as --oauth-cache
   LOGCLI_BRIDGE_OAUTH_LOGIN_PATH Same as --oauth-login-path
   LOGCLI_BRIDGE_OAUTH_BEARER_PROBE  Same as --oauth-bearer-probe when set to 1
@@ -175,7 +183,11 @@ case "${kube}" in
     1|true|yes|on|TRUE|True|YES|ON) kube="1" ;;
     *) kube="0" ;;
 esac
-oauth="${LOGCLI_BRIDGE_OAUTH:-1}"
+chrome_cookie_hijack="${LOGCLI_BRIDGE_CHROME_COOKIE_HIJACK:-0}"
+case "${chrome_cookie_hijack}" in
+    1|true|yes|on|TRUE|True|YES|ON) chrome_cookie_hijack="1" ;;
+    *) chrome_cookie_hijack="0" ;;
+esac
 oauth_cache="${LOGCLI_BRIDGE_OAUTH_CACHE:-${XDG_CACHE_HOME:-${HOME}/.cache}/logcli-bridge/session.json}"
 oauth_login_path="${LOGCLI_BRIDGE_OAUTH_LOGIN_PATH:-/login/generic_oauth}"
 oauth_bearer_probe="${LOGCLI_BRIDGE_OAUTH_BEARER_PROBE:-0}"
@@ -230,11 +242,8 @@ while [ "${#}" -gt 0 ]; do
             [ -z "${1}" ] && usage
             kube_context="${1}"
             ;;
-        --oauth)
-            oauth="1"
-            ;;
-        --no-oauth)
-            oauth="0"
+        --chrome-cookie-hijack)
+            chrome_cookie_hijack="1"
             ;;
         --oauth-cache)
             shift
@@ -318,6 +327,19 @@ fi
 [ -z "${grafana_host_arg}" ] && usage
 command -v python3 >/dev/null 2>&1 || fail "python3 not found in PATH"
 
+# Resolve the auth method explicitly: default OAuth, --chrome-cookie-hijack, or
+# explicit cookie. They are mutually exclusive; no implicit fallback.
+auth_method="oauth"
+if [ "${chrome_cookie_hijack}" = "1" ]; then
+    auth_method="chrome"
+fi
+if [ -n "${cookie}" ]; then
+    if [ "${chrome_cookie_hijack}" = "1" ]; then
+        fail "pick one auth method: --chrome-cookie-hijack and --cookie/LOGCLI_BRIDGE_COOKIE are mutually exclusive"
+    fi
+    auth_method="cookie"
+fi
+
 case "${grafana_host_arg}" in
     http://*|https://*)
         grafana_url="${grafana_host_arg}"
@@ -329,7 +351,7 @@ esac
 
 export LOGCLI_BRIDGE_GRAFANA_URL="${grafana_url}"
 export LOGCLI_BRIDGE_DATASOURCE="${datasource}"
-export LOGCLI_BRIDGE_OAUTH="${oauth}"
+export LOGCLI_BRIDGE_AUTH_METHOD="${auth_method}"
 export LOGCLI_BRIDGE_OAUTH_CACHE="${oauth_cache}"
 export LOGCLI_BRIDGE_OAUTH_LOGIN_PATH="${oauth_login_path}"
 export LOGCLI_BRIDGE_OAUTH_BEARER_PROBE="${oauth_bearer_probe}"
@@ -389,7 +411,7 @@ except Exception as exc:
 
 GRAFANA_URL = os.environ["LOGCLI_BRIDGE_GRAFANA_URL"].rstrip("/")
 DATASOURCE = os.environ["LOGCLI_BRIDGE_DATASOURCE"]
-OAUTH = os.environ.get("LOGCLI_BRIDGE_OAUTH", "1").lower() in ("1", "true", "yes", "on")
+AUTH_METHOD = os.environ.get("LOGCLI_BRIDGE_AUTH_METHOD", "oauth")
 OAUTH_CACHE = os.environ["LOGCLI_BRIDGE_OAUTH_CACHE"]
 OAUTH_LOGIN_PATH = os.environ.get("LOGCLI_BRIDGE_OAUTH_LOGIN_PATH", "/login/generic_oauth")
 if not OAUTH_LOGIN_PATH.startswith("/"):
@@ -609,12 +631,6 @@ def read_chrome_cookie_header():
         raise UserError(f"No valid grafana_session cookie found for {host}; log in to {GRAFANA_URL}")
 
     return "; ".join(f"{name}={value}" for name, value in morsel_values.items())
-
-
-def cookie_auth():
-    if COOKIE:
-        return make_cookie_auth(COOKIE, "cookie")
-    return make_cookie_auth(read_chrome_cookie_header(), "chrome")
 
 
 def read_oauth_cache():
@@ -1145,13 +1161,17 @@ async def oauth_auth():
 
 
 async def resolve_auth():
-    if COOKIE:
+    if AUTH_METHOD == "cookie":
+        if not COOKIE:
+            raise UserError("cookie auth selected but no cookie value set; pass --cookie or LOGCLI_BRIDGE_COOKIE")
         vprint("auth: using explicit cookie")
         return make_cookie_auth(COOKIE, "cookie")
-    if OAUTH:
+    if AUTH_METHOD == "chrome":
+        vprint("auth: using Chrome cookie hijack")
+        return make_cookie_auth(read_chrome_cookie_header(), "chrome")
+    if AUTH_METHOD == "oauth":
         return await oauth_auth()
-    vprint("auth: using Chrome cookie lookup")
-    return cookie_auth()
+    raise UserError(f"unknown auth method: {AUTH_METHOD!r}")
 
 
 async def fetch_datasource_uid(session, auth):
