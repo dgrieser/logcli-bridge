@@ -128,6 +128,9 @@ run_kube_bridge() {
     local pf_log
     pf_log="$(mktemp -t logcli-bridge-pf.XXXXXX)"
 
+    if [ "${verbose}" = "1" ]; then
+        echo "logcli-bridge: port-forward: ${kube_cmd[*]} port-forward ${kube_target} ${address_arg[*]} ${spec}" 1>&2
+    fi
     "${kube_cmd[@]}" port-forward "${kube_target}" "${address_arg[@]}" "${spec}" >"${pf_log}" 2>&1 &
     local pf_pid=$!
 
@@ -164,6 +167,7 @@ run_kube_bridge() {
     local logcli_cmd=(logcli "--addr=http://${bind_host}:${local_port}")
     [ "${verbose}" != "1" ] && logcli_cmd+=(--quiet)
     logcli_cmd+=("${logcli_args[@]}")
+    [ "${verbose}" = "1" ] && echo "logcli-bridge: running: ${logcli_cmd[*]}" 1>&2
     "${logcli_cmd[@]}"
     local rc=$?
 
@@ -380,6 +384,7 @@ import hashlib
 from html.parser import HTMLParser
 import json
 import os
+import shlex
 import shutil
 import secrets
 import sqlite3
@@ -1484,6 +1489,7 @@ async def run_logcli(port):
     if not VERBOSE:
         cmd.append("--quiet")
     cmd.extend(LOGCLI_ARGS)
+    vprint(f"running: {' '.join(shlex.quote(part) for part in cmd)}")
     proc = await asyncio.create_subprocess_exec(*cmd)
     try:
         return await proc.wait()
